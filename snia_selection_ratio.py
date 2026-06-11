@@ -18,6 +18,7 @@ cuts.json format — list of objects, each overriding any subset of the 7 cut pa
 """
 
 import argparse
+import csv
 import functools
 import json
 import logging
@@ -336,6 +337,8 @@ def main():
     )
     parser.add_argument("--plot", type=Path, default=None,
                         help="Save summary plot to this path (e.g. selection_ratio.png)")
+    parser.add_argument("--results-file", type=Path, default=None,
+                        help="Save results table to a CSV file")
     parser.add_argument("--log-file", type=Path, default=None,
                         help="Write log output to this file in addition to stdout")
     parser.add_argument("--verbose", action="store_true",
@@ -397,6 +400,21 @@ def main():
         print("-" * len(header))
         for cp, n_v50, n_v53, ratio in rows:
             print(f"{_row_label(cp):<{col_w}}  {n_v50:>7,}  {n_v53:>7,}  {ratio:>8.4f}")
+
+    if args.results_file is not None:
+        _cut_keys = ["snr_threshold", "n_phases", "phase_min", "phase_max",
+                     "n_before_peak", "n_after_peak", "n_bands"]
+        fieldnames = ["label"] + _cut_keys + ["N_v50", "N_v53", "ratio"]
+        with open(args.results_file, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for cp, n_v50, n_v53, ratio in rows:
+                writer.writerow({
+                    "label": _row_label(cp),
+                    **{k: cp[k] for k in _cut_keys},
+                    "N_v50": n_v50, "N_v53": n_v53, "ratio": round(ratio, 6),
+                })
+        logger.info("Results saved to %s", args.results_file)
 
     if args.plot is not None:
         save_summary_plot(rows, args.plot)
