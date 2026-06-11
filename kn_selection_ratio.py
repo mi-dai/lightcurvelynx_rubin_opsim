@@ -20,6 +20,7 @@ cuts.json format — list of objects, each overriding any subset of the 7 cut pa
 import argparse
 import functools
 import json
+import logging
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -39,6 +40,8 @@ from lightcurvelynx.simulate import simulate_lightcurves
 from lightcurvelynx.utils.extrapolate import LinearDecayOnMag, ZeroPadding
 
 from redback import model_library
+
+logger = logging.getLogger(__name__)
 
 _OPSIM_SQL = "SELECT * FROM observations WHERE scheduler_note NOT LIKE 'DD:%'"
 _KN_RATE = 1.0e-6  # yr^-1 Mpc^-3 (Scolnic et al. 2018)
@@ -74,19 +77,18 @@ def _lc_quality_cuts(flux, mjd, filter, z, t0,
     return {"pass_quality_cuts": pass_cut}
 
 
-def run_simulation(opsim_path, seed, fraction, verbose):
+def run_simulation(opsim_path, seed, fraction):
     """Simulate KN light curves; return raw results DataFrame (no cuts applied)."""
     rng = np.random.default_rng(seed)
     p = SIM_PARAMS
 
+    logger.info("Loading OpSim from %s", opsim_path)
     opsim = OpSim.from_db(opsim_path, sql_query=_OPSIM_SQL)
-    if verbose:
-        print(f"  OpSim: {len(opsim):,} observations  "
-              f"(MJD {opsim['time'].min():.1f} – {opsim['time'].max():.1f})")
+    logger.info("OpSim loaded: %s observations (MJD %.1f – %.1f)",
+                f"{len(opsim):,}", opsim["time"].min(), opsim["time"].max())
 
     sky_coverage = opsim.estimate_coverage()
-    if verbose:
-        print(f"  Sky coverage: {sky_coverage:.0f} deg²")
+    logger.info("Sky coverage: %.0f deg²", sky_coverage)
 
     t_min = float(opsim["time"].min())
     t_max = float(opsim["time"].max())
@@ -104,8 +106,7 @@ def run_simulation(opsim_path, seed, fraction, verbose):
         Omega_m=p["Omega_m"],
     )
     nsn = int(int(nsntotal[0] * survey_length) * fraction)
-    if verbose:
-        print(f"  Simulating {nsn:,} KNe ({fraction*100:.1f}% of expected)")
+    logger.info("Simulating %s KNe (%.1f%% of expected)", f"{nsn:,}", fraction * 100)
 
     passbands = PassbandGroup.from_preset("LSST", filters=p["filters"])
 
@@ -154,6 +155,7 @@ def run_simulation(opsim_path, seed, fraction, verbose):
     except ImportError:
         executor = None
 
+    logger.info("Running simulate_lightcurves ...")
     results = simulate_lightcurves(
         model=source,
         num_samples=nsn,
@@ -168,13 +170,12 @@ def run_simulation(opsim_path, seed, fraction, verbose):
         rest_time_window_offset=(0.1, 50),
     )
 
-    if verbose:
-        print(f"  Simulated {len(results):,} KNe")
+    logger.info("Simulation done: %s light curves generated", f"{len(results):,}")
 
     return results
 
 
-def apply_cuts(results, cut_params, verbose=False):
+def apply_cuts(results, cut_params):
     """Apply selection cuts to raw simulation results; return survivor count."""
     lightcurves = results.dropna(subset=["lightcurve"])
     lightcurves["lightcurve.snr"] = (
@@ -210,10 +211,9 @@ def apply_cuts(results, cut_params, verbose=False):
     idx = pass_quality_cut.query("pass_quality_cuts == True").index
     n_after_quality = len(idx)
 
-    if verbose:
-        print(f"    Before detection cut: {n_before_det:,}")
-        print(f"    After  detection cut: {n_after_det:,}")
-        print(f"    After  quality  cuts: {n_after_quality:,}")
+    logger.info("  Before detection cut: %s", f"{n_before_det:,}")
+    logger.info("  After  detection cut: %s", f"{n_after_det:,}")
+    logger.info("  After  quality  cuts: %s", f"{n_after_quality:,}")
 
     return n_after_quality
 
@@ -259,7 +259,7 @@ def save_summary_plot(rows, path):
     fig.suptitle("KN yield comparison: OpSim v5.0.1 vs v5.3.0", fontsize=12)
     plt.tight_layout()
     plt.savefig(path, dpi=150, bbox_inches="tight")
-    print(f"Plot saved to {path}")
+    logger.info("Plot saved to %s", path)
 
 
 def main():
@@ -303,10 +303,25 @@ def main():
     )
     parser.add_argument("--plot", type=Path, default=None,
                         help="Save summary plot to this path (e.g. kn_ratio.png)")
+    parser.add_argument("--log-file", type=Path, default=None,
+                        help="Write log output to this file in addition to stdout")
     parser.add_argument("--verbose", action="store_true",
-                        help="Print per-step counts")
+                        help="Print progress logs to stdout")
 
     args = parser.parse_args()
+
+    handlers = []
+    if args.verbose:
+        handlers.append(logging.StreamHandler())
+    if args.log_file:
+        handlers.append(logging.FileHandler(args.log_file))
+    if handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s  %(message)s",
+            datefmt="%H:%M:%S",
+            handlers=handlers,
+        )
 
     default_cut_params = {
         "snr_threshold": args.snr_threshold,
@@ -324,22 +339,17 @@ def main():
     else:
         cut_combos = [default_cut_params]
 
-    # Simulate once per OpSim version
-    if args.verbose:
-        print("=== Simulating v5.0.1 ===")
-    results_v50 = run_simulation(args.opsim_v50, args.seed, args.fraction, args.verbose)
+    logger.info("=== Simulating v5.0.1 ===")
+    results_v50 = run_simulation(args.opsim_v50, args.seed, args.fraction)
 
-    if args.verbose:
-        print("=== Simulating v5.3.0 ===")
-    results_v53 = run_simulation(args.opsim_v53, args.seed, args.fraction, args.verbose)
+    logger.info("=== Simulating v5.3.0 ===")
+    results_v53 = run_simulation(args.opsim_v53, args.seed, args.fraction)
 
-    # Apply each cut combo
     rows = []
     for cp in cut_combos:
-        if args.verbose:
-            print(f"--- cuts: {_fmt_cut_params(cp)} ---")
-        n_v50 = apply_cuts(results_v50, cp, verbose=args.verbose)
-        n_v53 = apply_cuts(results_v53, cp, verbose=args.verbose)
+        logger.info("--- cuts: %s ---", _fmt_cut_params(cp))
+        n_v50 = apply_cuts(results_v50, cp)
+        n_v53 = apply_cuts(results_v53, cp)
         ratio = n_v50 / n_v53 if n_v53 > 0 else float("nan")
         rows.append((cp, n_v50, n_v53, ratio))
 
