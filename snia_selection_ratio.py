@@ -1,0 +1,305 @@
+"""
+Compute the ratio N_v50 / N_v53 of SN Ia survivors after selection cuts
+for LSST OpSim baselines v5.0.1 and v5.3.0.
+
+Usage:
+    python snia_selection_ratio.py [--snr-threshold 5.0] [--n-phases 10] ...
+"""
+
+import argparse
+import functools
+from pathlib import Path
+
+import numpy as np
+from scipy.interpolate import interp1d
+
+from lightcurvelynx import _LIGHTCURVELYNX_DOWNLOAD_DATA_DIR
+from lightcurvelynx.astro_utils.dustmap import SFDMap
+from lightcurvelynx.astro_utils.passbands import PassbandGroup
+from lightcurvelynx.astro_utils.snia_utils import (
+    DistModFromRedshift,
+    X0FromDistMod,
+    num_snia_per_redshift_bin,
+    snia_volumetric_rates,
+)
+from lightcurvelynx.effects.extinction import ExtinctionEffect
+from lightcurvelynx.math_nodes.np_random import NumpyRandomFunc
+from lightcurvelynx.math_nodes.ra_dec_sampler import ApproximateMOCSampler
+from lightcurvelynx.math_nodes.scipy_random import SamplePDF
+from lightcurvelynx.models.sncosmo_models import SncosmoWrapperModel
+from lightcurvelynx.obstable.opsim import OpSim
+from lightcurvelynx.simulate import simulate_lightcurves
+from lightcurvelynx.utils.extrapolate import LinearDecayOnMag, ZeroPadding
+
+_OPSIM_SQL = "SELECT * FROM observations WHERE scheduler_note NOT LIKE 'DD:%'"
+
+SIM_PARAMS = {
+    "H0": 70.0,
+    "Omega_m": 0.315,
+    "w": -1.0,
+    "zmin": 0.001,
+    "zmax": 1.0,
+    "znbins": 100,
+    "alpha": 0.15,
+    "beta": 3.15,
+    "x1_mean": 0.973,
+    "x1_sigma_minus": 1.472,
+    "x1_sigma_plus": 0.222,
+    "c_mean": -0.054,
+    "c_sigma_minus": 0.043,
+    "c_sigma_plus": 0.101,
+    "m_abs_mean": -19.3,
+    "m_abs_sigma": 0.1,
+    "filters": ["u", "g", "r", "i", "z", "y"],
+}
+
+
+def _asymmetric_gaussian_pdf(x, mu, sigma_minus, sigma_plus):
+    norm_factor = np.sqrt(2 / np.pi) / (sigma_minus + sigma_plus)
+    return np.where(
+        x < mu,
+        norm_factor * np.exp(-0.5 * ((x - mu) / sigma_minus) ** 2),
+        norm_factor * np.exp(-0.5 * ((x - mu) / sigma_plus) ** 2),
+    )
+
+
+def _lc_quality_cuts(flux, mjd, filter, z, t0,
+                     n_phases, phase_min, phase_max,
+                     n_before_peak, n_after_peak, n_bands):
+    phases = np.floor((mjd - t0) / (1.0 + z))
+    unique_phases, unique_idx = np.unique(phases, return_index=True)
+    good_idx = (unique_phases >= phase_min) & (unique_phases <= phase_max)
+    if np.sum(good_idx) == 0:
+        return {"pass_quality_cuts": False}
+    pass_cut = len(unique_phases[good_idx]) >= n_phases
+    pass_cut &= np.sum(unique_phases[good_idx] < 0) >= n_before_peak
+    pass_cut &= np.sum(unique_phases[good_idx] > 0) >= n_after_peak
+    pass_cut &= len(np.unique(filter[unique_idx][good_idx])) >= n_bands
+    return {"pass_quality_cuts": pass_cut}
+
+
+def run_simulation(opsim_path, cut_params, seed, fraction, verbose):
+    """Run one full simulation + selection pipeline; return survivor count."""
+    rng = np.random.default_rng(seed)
+    p = SIM_PARAMS
+
+    # --- Load OpSim ---
+    opsim = OpSim.from_db(opsim_path, sql_query=_OPSIM_SQL)
+    if verbose:
+        print(f"  OpSim: {len(opsim):,} observations  "
+              f"(MJD {opsim['time'].min():.1f} – {opsim['time'].max():.1f})")
+
+    sky_coverage = opsim.estimate_coverage()
+    if verbose:
+        print(f"  Sky coverage: {sky_coverage:.0f} deg²")
+
+    t_min = float(opsim["time"].min())
+    t_max = float(opsim["time"].max())
+    survey_length = (t_max - t_min) / 365.25
+    solid_angle = sky_coverage * (np.pi / 180.0) ** 2
+
+    # --- Number of SNe to simulate ---
+    nsntotal, _ = num_snia_per_redshift_bin(
+        p["zmin"], p["zmax"],
+        znbins=1,
+        solid_angle=solid_angle,
+        vol_rate_function=snia_volumetric_rates,
+        H0=p["H0"],
+        Omega_m=p["Omega_m"],
+    )
+    nsn = int(int(nsntotal[0] * survey_length) * fraction)
+    if verbose:
+        print(f"  Simulating {nsn:,} SNe Ia ({fraction*100:.1f}% of expected)")
+
+    # --- Passbands ---
+    passbands = PassbandGroup.from_preset("LSST", filters=p["filters"])
+
+    # --- Redshift PDF ---
+    nsn_per_bin, z_mean = num_snia_per_redshift_bin(
+        p["zmin"], p["zmax"], p["znbins"],
+        H0=p["H0"], Omega_m=p["Omega_m"],
+    )
+    zpdf = interp1d(z_mean, nsn_per_bin, bounds_error=False, fill_value=0)
+
+    # --- Source model ---
+    moc = opsim.build_moc(max_depth=12)
+    radec = ApproximateMOCSampler(moc, node_label="radec")
+    z_func = SamplePDF(zpdf, node_label="redshift")
+
+    def x1_pdf(x):
+        return _asymmetric_gaussian_pdf(
+            x, p["x1_mean"], p["x1_sigma_minus"], p["x1_sigma_plus"]
+        )
+
+    def c_pdf(c):
+        return _asymmetric_gaussian_pdf(
+            c, p["c_mean"], p["c_sigma_minus"], p["c_sigma_plus"]
+        )
+
+    x1_func = SamplePDF(x1_pdf, node_label="x1")
+    c_func = SamplePDF(c_pdf, node_label="c")
+    m_abs_func = NumpyRandomFunc("normal", loc=p["m_abs_mean"], scale=p["m_abs_sigma"])
+    distmod_func = DistModFromRedshift(z_func, H0=p["H0"], Omega_m=p["Omega_m"])
+    x0_func = X0FromDistMod(
+        distmod=distmod_func,
+        x1=x1_func,
+        c=c_func,
+        alpha=p["alpha"],
+        beta=p["beta"],
+        m_abs=m_abs_func,
+        node_label="x0_func",
+    )
+
+    source = SncosmoWrapperModel(
+        "salt3",
+        t0=NumpyRandomFunc("uniform", low=t_min, high=t_max),
+        x0=x0_func,
+        x1=x1_func,
+        c=c_func,
+        ra=radec.ra,
+        dec=radec.dec,
+        redshift=z_func,
+        node_label="source",
+        time_extrapolation=(ZeroPadding(), LinearDecayOnMag(decay_rate=0.02, mag_thres=30.0)),
+        wave_extrapolation=(ZeroPadding(), ZeroPadding()),
+    )
+    mwextinction = SFDMap(ra=source.ra, dec=source.dec, node_label="mwext")
+    source.add_effect(
+        ExtinctionEffect(
+            extinction_model="F99", ebv=mwextinction,
+            r_v=3.1, frame="observer", backend="dust_extinction",
+        )
+    )
+
+    # --- Simulate ---
+    param_cols = [
+        "source.t0", "source.x0", "source.x1", "source.c",
+        "source.redshift", "source.ra", "source.dec", "x0_func.distmod",
+    ]
+    try:
+        import loky
+        executor = loky.get_reusable_executor(max_workers=4)
+    except ImportError:
+        executor = None
+
+    results = simulate_lightcurves(
+        model=source,
+        num_samples=nsn,
+        survey_info=opsim,
+        passbands=passbands,
+        param_cols=param_cols,
+        obstable_save_cols=["zp"],
+        rng=rng,
+        num_jobs=4,
+        batch_size=2000,
+        executor=executor,
+    )
+
+    # --- Selection cuts ---
+    lightcurves = results.dropna(subset=["lightcurve"])
+    lightcurves["lightcurve.snr"] = (
+        lightcurves["lightcurve.flux"] / lightcurves["lightcurve.fluxerr"]
+    )
+    lightcurves["lightcurve.detection_flag"] = (
+        lightcurves["lightcurve.snr"] > cut_params["snr_threshold"]
+    )
+
+    lightcurves_after_drop_sat = lightcurves.query(
+        "lightcurve.is_saturated == False"
+    ).dropna(subset=["lightcurve"])
+
+    n_before_det = len(lightcurves)
+    lightcurves_after_detection = lightcurves_after_drop_sat.query(
+        "lightcurve.detection_flag == True"
+    ).dropna(subset=["lightcurve"])
+    n_after_det = len(lightcurves_after_detection)
+
+    quality_cut_fn = functools.partial(
+        _lc_quality_cuts,
+        n_phases=cut_params["n_phases"],
+        phase_min=cut_params["phase_min"],
+        phase_max=cut_params["phase_max"],
+        n_before_peak=cut_params["n_before_peak"],
+        n_after_peak=cut_params["n_after_peak"],
+        n_bands=cut_params["n_bands"],
+    )
+    pass_quality_cut = lightcurves_after_detection.reduce(
+        quality_cut_fn,
+        "lightcurve.flux", "lightcurve.mjd", "lightcurve.filter", "z", "t0",
+    )
+    idx = pass_quality_cut.query("pass_quality_cuts == True").index
+    n_after_quality = len(idx)
+
+    if verbose:
+        print(f"  Before detection cut: {n_before_det:,}")
+        print(f"  After  detection cut: {n_after_det:,}")
+        print(f"  After  quality  cuts: {n_after_quality:,}")
+
+    return n_after_quality
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compute N_v50 / N_v53 SN Ia yield ratio for two OpSim baselines."
+    )
+    # Selection cut options
+    parser.add_argument("--snr-threshold", type=float, default=5.0,
+                        help="SNR detection threshold (default: 5.0)")
+    parser.add_argument("--n-phases", type=int, default=10,
+                        help="Min unique phases in window (default: 10)")
+    parser.add_argument("--phase-min", type=int, default=-10,
+                        help="Phase window start in rest-frame days (default: -10)")
+    parser.add_argument("--phase-max", type=int, default=40,
+                        help="Phase window end in rest-frame days (default: 40)")
+    parser.add_argument("--n-before-peak", type=int, default=2,
+                        help="Min pre-peak observations (default: 2)")
+    parser.add_argument("--n-after-peak", type=int, default=3,
+                        help="Min post-peak observations (default: 3)")
+    parser.add_argument("--n-bands", type=int, default=2,
+                        help="Min distinct bands (default: 2)")
+    # Simulation options
+    parser.add_argument("--fraction", type=float, default=0.002,
+                        help="Fraction of expected SNe to simulate (default: 0.002)")
+    parser.add_argument("--seed", type=int, default=1024,
+                        help="Random seed (default: 1024)")
+    parser.add_argument(
+        "--opsim-v50",
+        type=Path,
+        default=_LIGHTCURVELYNX_DOWNLOAD_DATA_DIR / "opsim" / "baseline_v5.0.1_10yrs.db",
+        help="Path to OpSim v5.0.1 database",
+    )
+    parser.add_argument(
+        "--opsim-v53",
+        type=Path,
+        default=_LIGHTCURVELYNX_DOWNLOAD_DATA_DIR / "opsim" / "baseline_v5.3.0_10yrs.db",
+        help="Path to OpSim v5.3.0 database",
+    )
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print per-step counts for each simulation")
+
+    args = parser.parse_args()
+
+    cut_params = {
+        "snr_threshold": args.snr_threshold,
+        "n_phases": args.n_phases,
+        "phase_min": args.phase_min,
+        "phase_max": args.phase_max,
+        "n_before_peak": args.n_before_peak,
+        "n_after_peak": args.n_after_peak,
+        "n_bands": args.n_bands,
+    }
+
+    if args.verbose:
+        print("=== v5.0.1 ===")
+    n_v50 = run_simulation(args.opsim_v50, cut_params, args.seed, args.fraction, args.verbose)
+
+    if args.verbose:
+        print("=== v5.3.0 ===")
+    n_v53 = run_simulation(args.opsim_v53, cut_params, args.seed, args.fraction, args.verbose)
+
+    ratio = n_v50 / n_v53 if n_v53 > 0 else float("nan")
+    print(f"ratio = N_v50 / N_v53 = {ratio:.4f}  (N_v50={n_v50:,}, N_v53={n_v53:,})")
+
+
+if __name__ == "__main__":
+    main()
