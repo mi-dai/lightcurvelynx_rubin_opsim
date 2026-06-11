@@ -1,0 +1,10 @@
+[
+  {"label": "default", "snr_threshold": 5.0, "n_phases": 5, "phase_min": -10, "phase_max": 40, "n_before_peak": 0, "n_after_peak": 1, "n_bands": 1},
+  {"label": "low_snr", "snr_threshold": 3.0, "n_phases": 5},
+  {"label": "high_snr", "snr_threshold": 7.0, "n_phases": 5},
+  {"label": "fewer_phases", "snr_threshold": 5.0, "n_phases": 3},
+  {"label": "more_phases", "snr_threshold": 5.0, "n_phases": 8},
+  {"label": "require_postpeak", "snr_threshold": 5.0, "n_phases": 5, "n_after_peak": 2},
+  {"label": "multi_band", "snr_threshold": 5.0, "n_phases": 5, "n_bands": 2},
+  {"label": "wider_window", "snr_threshold": 5.0, "n_phases": 5, "phase_min": -15, "phase_max": 50}
+]
