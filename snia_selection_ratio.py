@@ -22,6 +22,8 @@ import functools
 import json
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+
 import numpy as np
 from scipy.interpolate import interp1d
 
@@ -251,6 +253,42 @@ def apply_cuts(results, cut_params, verbose=False):
     return n_after_quality
 
 
+def _row_label(cp):
+    return cp.get("label", _fmt_cut_params(cp))
+
+
+def save_summary_plot(rows, path):
+    labels = [_row_label(cp) for cp, *_ in rows]
+    n_v50 = [r[1] for r in rows]
+    n_v53 = [r[2] for r in rows]
+    ratios = [r[3] for r in rows]
+
+    x = range(len(rows))
+    width = 0.35
+
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(max(8, len(rows) * 1.2), 8),
+                                         sharex=True)
+    fig.subplots_adjust(hspace=0.08)
+
+    bars1 = ax_top.bar([i - width / 2 for i in x], n_v50, width, label="v5.0.1", color="steelblue")
+    bars2 = ax_top.bar([i + width / 2 for i in x], n_v53, width, label="v5.3.0", color="darkorange")
+    ax_top.set_ylabel("SNe Ia surviving cuts")
+    ax_top.legend()
+    ax_top.bar_label(bars1, fmt="%d", fontsize=8, padding=2)
+    ax_top.bar_label(bars2, fmt="%d", fontsize=8, padding=2)
+
+    ax_bot.bar(x, ratios, color="steelblue", alpha=0.7)
+    ax_bot.axhline(1.0, color="k", linestyle="--", linewidth=0.8)
+    ax_bot.set_ylabel("N_v50 / N_v53")
+    ax_bot.set_xticks(list(x))
+    ax_bot.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
+
+    fig.suptitle("SN Ia yield comparison: OpSim v5.0.1 vs v5.3.0", fontsize=12)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"Plot saved to {path}")
+
+
 def _fmt_cut_params(cp):
     return (
         f"snr={cp['snr_threshold']} phases={cp['n_phases']} "
@@ -298,6 +336,8 @@ def main():
         default=_LIGHTCURVELYNX_DOWNLOAD_DATA_DIR / "opsim" / "baseline_v5.3.0_10yrs.db",
         help="Path to OpSim v5.3.0 database",
     )
+    parser.add_argument("--plot", type=Path, default=None,
+                        help="Save summary plot to this path (e.g. selection_ratio.png)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print per-step counts")
 
@@ -342,12 +382,15 @@ def main():
         cp, n_v50, n_v53, ratio = rows[0]
         print(f"ratio = N_v50 / N_v53 = {ratio:.4f}  (N_v50={n_v50:,}, N_v53={n_v53:,})")
     else:
-        col_w = max(len(_fmt_cut_params(r[0])) for r in rows)
-        header = f"{'cut_params':<{col_w}}  {'N_v50':>7}  {'N_v53':>7}  {'ratio':>8}"
+        col_w = max(len(_row_label(r[0])) for r in rows)
+        header = f"{'label':<{col_w}}  {'N_v50':>7}  {'N_v53':>7}  {'ratio':>8}"
         print(header)
         print("-" * len(header))
         for cp, n_v50, n_v53, ratio in rows:
-            print(f"{_fmt_cut_params(cp):<{col_w}}  {n_v50:>7,}  {n_v53:>7,}  {ratio:>8.4f}")
+            print(f"{_row_label(cp):<{col_w}}  {n_v50:>7,}  {n_v53:>7,}  {ratio:>8.4f}")
+
+    if args.plot is not None:
+        save_summary_plot(rows, args.plot)
 
 
 if __name__ == "__main__":
