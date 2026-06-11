@@ -3,11 +3,23 @@ Compute the ratio N_v50 / N_v53 of SN Ia survivors after selection cuts
 for LSST OpSim baselines v5.0.1 and v5.3.0.
 
 Usage:
+    # single cut combo (CLI args)
     python snia_selection_ratio.py [--snr-threshold 5.0] [--n-phases 10] ...
+
+    # sweep over many cut combos without re-running the simulation
+    python snia_selection_ratio.py --cuts-file cuts.json [--verbose]
+
+cuts.json format — list of objects, each overriding any subset of the 7 cut params:
+    [
+      {"snr_threshold": 5.0, "n_phases": 10},
+      {"snr_threshold": 3.0, "n_phases": 10},
+      {"snr_threshold": 5.0, "n_phases": 7, "n_before_peak": 1}
+    ]
 """
 
 import argparse
 import functools
+import json
 from pathlib import Path
 
 import numpy as np
@@ -78,12 +90,11 @@ def _lc_quality_cuts(flux, mjd, filter, z, t0,
     return {"pass_quality_cuts": pass_cut}
 
 
-def run_simulation(opsim_path, cut_params, seed, fraction, verbose):
-    """Run one full simulation + selection pipeline; return survivor count."""
+def run_simulation(opsim_path, seed, fraction, verbose):
+    """Simulate light curves; return raw results DataFrame (no cuts applied)."""
     rng = np.random.default_rng(seed)
     p = SIM_PARAMS
 
-    # --- Load OpSim ---
     opsim = OpSim.from_db(opsim_path, sql_query=_OPSIM_SQL)
     if verbose:
         print(f"  OpSim: {len(opsim):,} observations  "
@@ -98,7 +109,6 @@ def run_simulation(opsim_path, cut_params, seed, fraction, verbose):
     survey_length = (t_max - t_min) / 365.25
     solid_angle = sky_coverage * (np.pi / 180.0) ** 2
 
-    # --- Number of SNe to simulate ---
     nsntotal, _ = num_snia_per_redshift_bin(
         p["zmin"], p["zmax"],
         znbins=1,
@@ -111,17 +121,14 @@ def run_simulation(opsim_path, cut_params, seed, fraction, verbose):
     if verbose:
         print(f"  Simulating {nsn:,} SNe Ia ({fraction*100:.1f}% of expected)")
 
-    # --- Passbands ---
     passbands = PassbandGroup.from_preset("LSST", filters=p["filters"])
 
-    # --- Redshift PDF ---
     nsn_per_bin, z_mean = num_snia_per_redshift_bin(
         p["zmin"], p["zmax"], p["znbins"],
         H0=p["H0"], Omega_m=p["Omega_m"],
     )
     zpdf = interp1d(z_mean, nsn_per_bin, bounds_error=False, fill_value=0)
 
-    # --- Source model ---
     moc = opsim.build_moc(max_depth=12)
     radec = ApproximateMOCSampler(moc, node_label="radec")
     z_func = SamplePDF(zpdf, node_label="redshift")
@@ -171,7 +178,6 @@ def run_simulation(opsim_path, cut_params, seed, fraction, verbose):
         )
     )
 
-    # --- Simulate ---
     param_cols = [
         "source.t0", "source.x0", "source.x1", "source.c",
         "source.redshift", "source.ra", "source.dec", "x0_func.distmod",
@@ -195,7 +201,14 @@ def run_simulation(opsim_path, cut_params, seed, fraction, verbose):
         executor=executor,
     )
 
-    # --- Selection cuts ---
+    if verbose:
+        print(f"  Simulated {len(results):,} SNe Ia")
+
+    return results
+
+
+def apply_cuts(results, cut_params, verbose=False):
+    """Apply selection cuts to raw simulation results; return survivor count."""
     lightcurves = results.dropna(subset=["lightcurve"])
     lightcurves["lightcurve.snr"] = (
         lightcurves["lightcurve.flux"] / lightcurves["lightcurve.fluxerr"]
@@ -231,18 +244,26 @@ def run_simulation(opsim_path, cut_params, seed, fraction, verbose):
     n_after_quality = len(idx)
 
     if verbose:
-        print(f"  Before detection cut: {n_before_det:,}")
-        print(f"  After  detection cut: {n_after_det:,}")
-        print(f"  After  quality  cuts: {n_after_quality:,}")
+        print(f"    Before detection cut: {n_before_det:,}")
+        print(f"    After  detection cut: {n_after_det:,}")
+        print(f"    After  quality  cuts: {n_after_quality:,}")
 
     return n_after_quality
+
+
+def _fmt_cut_params(cp):
+    return (
+        f"snr={cp['snr_threshold']} phases={cp['n_phases']} "
+        f"bef={cp['n_before_peak']} aft={cp['n_after_peak']} "
+        f"bands={cp['n_bands']} [{cp['phase_min']},{cp['phase_max']}]"
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Compute N_v50 / N_v53 SN Ia yield ratio for two OpSim baselines."
     )
-    # Selection cut options
+    # Selection cut defaults (used when no --cuts-file, or as fallback values)
     parser.add_argument("--snr-threshold", type=float, default=5.0,
                         help="SNR detection threshold (default: 5.0)")
     parser.add_argument("--n-phases", type=int, default=10,
@@ -257,6 +278,9 @@ def main():
                         help="Min post-peak observations (default: 3)")
     parser.add_argument("--n-bands", type=int, default=2,
                         help="Min distinct bands (default: 2)")
+    # Batch mode
+    parser.add_argument("--cuts-file", type=Path, default=None,
+                        help="JSON file with list of cut-parameter objects to sweep")
     # Simulation options
     parser.add_argument("--fraction", type=float, default=0.002,
                         help="Fraction of expected SNe to simulate (default: 0.002)")
@@ -275,11 +299,11 @@ def main():
         help="Path to OpSim v5.3.0 database",
     )
     parser.add_argument("--verbose", action="store_true",
-                        help="Print per-step counts for each simulation")
+                        help="Print per-step counts")
 
     args = parser.parse_args()
 
-    cut_params = {
+    default_cut_params = {
         "snr_threshold": args.snr_threshold,
         "n_phases": args.n_phases,
         "phase_min": args.phase_min,
@@ -289,16 +313,41 @@ def main():
         "n_bands": args.n_bands,
     }
 
+    if args.cuts_file is not None:
+        overrides = json.loads(args.cuts_file.read_text())
+        cut_combos = [{**default_cut_params, **o} for o in overrides]
+    else:
+        cut_combos = [default_cut_params]
+
+    # Simulate once per OpSim version
     if args.verbose:
-        print("=== v5.0.1 ===")
-    n_v50 = run_simulation(args.opsim_v50, cut_params, args.seed, args.fraction, args.verbose)
+        print("=== Simulating v5.0.1 ===")
+    results_v50 = run_simulation(args.opsim_v50, args.seed, args.fraction, args.verbose)
 
     if args.verbose:
-        print("=== v5.3.0 ===")
-    n_v53 = run_simulation(args.opsim_v53, cut_params, args.seed, args.fraction, args.verbose)
+        print("=== Simulating v5.3.0 ===")
+    results_v53 = run_simulation(args.opsim_v53, args.seed, args.fraction, args.verbose)
 
-    ratio = n_v50 / n_v53 if n_v53 > 0 else float("nan")
-    print(f"ratio = N_v50 / N_v53 = {ratio:.4f}  (N_v50={n_v50:,}, N_v53={n_v53:,})")
+    # Apply each cut combo
+    rows = []
+    for cp in cut_combos:
+        if args.verbose:
+            print(f"--- cuts: {_fmt_cut_params(cp)} ---")
+        n_v50 = apply_cuts(results_v50, cp, verbose=args.verbose)
+        n_v53 = apply_cuts(results_v53, cp, verbose=args.verbose)
+        ratio = n_v50 / n_v53 if n_v53 > 0 else float("nan")
+        rows.append((cp, n_v50, n_v53, ratio))
+
+    if len(rows) == 1:
+        cp, n_v50, n_v53, ratio = rows[0]
+        print(f"ratio = N_v50 / N_v53 = {ratio:.4f}  (N_v50={n_v50:,}, N_v53={n_v53:,})")
+    else:
+        col_w = max(len(_fmt_cut_params(r[0])) for r in rows)
+        header = f"{'cut_params':<{col_w}}  {'N_v50':>7}  {'N_v53':>7}  {'ratio':>8}"
+        print(header)
+        print("-" * len(header))
+        for cp, n_v50, n_v53, ratio in rows:
+            print(f"{_fmt_cut_params(cp):<{col_w}}  {n_v50:>7,}  {n_v53:>7,}  {ratio:>8.4f}")
 
 
 if __name__ == "__main__":
