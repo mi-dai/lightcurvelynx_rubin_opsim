@@ -48,7 +48,7 @@ from lightcurvelynx.utils.extrapolate import LinearDecayOnMag, ZeroPadding
 
 logger = logging.getLogger(__name__)
 
-_OPSIM_SQL = "SELECT * FROM observations WHERE scheduler_note NOT LIKE 'DD:%'"
+_OPSIM_SQL = "SELECT * FROM observations WHERE target_name NOT LIKE '%DDF%' AND target_name LIKE '%lowdust%'"
 
 SIM_PARAMS = {
     "H0": 70.0,
